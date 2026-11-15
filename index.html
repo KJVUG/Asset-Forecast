@@ -1305,6 +1305,7 @@
         <h3 data-page-node-id="4Qy7aDW40hVNTRAW1xRc7C">月度收入明细<span class="hcount" id="histCount" data-page-node-id="Dlk36dklkqy4gkoIly35bc"></span></h3>
         <div style="display:flex;gap:6px" data-page-node-id="5pPRe0Dt033thYB7jrMKW0">
           <button class="btn mini" onclick="addHist()" data-page-node-id="BXAsvfXyoY4xaMUX6rfYLw">＋ 添加月份</button>
+          <label class="btn mini" id="histPick" title="支持 .xlsx / .csv；逐日记录表会自动按月汇总" data-page-node-id="histPickLbl">＋ 导入表格<input type="file" id="histFile" accept=".xlsx,.csv,.txt" style="display:none" onchange="importHistFile(this)"></label>
           <button class="btn mini" onclick="clearHist()" data-page-node-id="Dth0PfchCMpzwj1sJuNhB6">清空本年</button>
         </div>
       </div>
@@ -1326,8 +1327,9 @@
         </div>
         <div class="hist-fade" id="histFade" aria-hidden="true" data-page-node-id="26WrheIcM9E0oYGrWA9iFA"></div>
       </div>
+      <div class="bi-status" id="histStatus" data-page-node-id="histStatusBox"></div>
       <div class="ed-foot" data-page-node-id="NzAIYbshPYzCPJrcMMY7O4">
-        只录入选定年份的月份，跨年记录互不影响。工时用于计算有效时薪（元/小时），可留空；实发合计 = 基本工资 + 加班/其他，自动计算。<span class="hint" id="histScrollHint" data-page-node-id="Yu0zf8dIc0BsrG7kTltr2u"></span>
+        只录入选定年份的月份，跨年记录互不影响。工时用于计算有效时薪（元/小时），可留空；实发合计 = 基本工资 + 加班/其他，自动计算。可「导入表格」：逐日记录表（一天一行）按日期自动汇总成每月一条，也接受已是月度的汇总表。<span class="hint" id="histScrollHint" data-page-node-id="Yu0zf8dIc0BsrG7kTltr2u"></span>
       </div>
     </div>
 
@@ -6279,7 +6281,11 @@ function parseSheet(xml, ss){
   }
   return rows;
 }
-async function parseXLSXRows(buf, fname){
+/* 读出工作表的二维数组（纯表格，不含任何业务语义）。
+   text 供上层做「内容判定」用（账单靠它识别支付宝/微信），收入表用不到。
+   把这一层单独抽出来，是因为账单导入和收入表导入要共用同一套 XLSX 解析，
+   但绝不能共用「二维表 → 账单」那一步。 */
+async function xlsxToRows(buf){
   const z = await unzip(buf);
   const names = Object.keys(z.out);
   const sheetName = names.find(n=> /^xl\/worksheets\/sheet1\.xml$/i.test(n))
@@ -6289,8 +6295,11 @@ async function parseXLSXRows(buf, fname){
   const shXml = await readZipEntry(z, sheetName);
   if(!shXml) throw new Error('工作表内容为空，请另存为 CSV 再导入');
   const ss = parseShared(ssXml);
-  const rows = parseSheet(shXml, ss);
-  return rowsToBills(rows, ss.join('\n').slice(0, 4000), fname);
+  return {rows: parseSheet(shXml, ss), text: ss.join('\n')};
+}
+async function parseXLSXRows(buf, fname){
+  const {rows, text} = await xlsxToRows(buf);
+  return rowsToBills(rows, text.slice(0, 4000), fname);
 }
 
 /* ---------- 统一入口：按扩展名 / 文件头分流 ---------- */
@@ -6305,6 +6314,244 @@ async function parseBillFile(file){
   if(isZip) return await parseXLSXRows(buf, name);
   const text = decodeText(buf);
   return rowsToBills(splitCSV(text), text, name);
+}
+
+/* =========================================================
+   收入表导入：逐日记录表 / 月度汇总表 → {m, base, ot, hours}
+   ---------------------------------------------------------
+   三个设计约束（都是被真实文件逼出来的）：
+
+   1) 按「列名」映射，不按「列位置」
+      手工记录表里空单元格在 CSV 中会塌陷，同一份文件不同行的列数
+      可能不相等（11/20 行 11 列、11/22 行 9 列），位置完全不可靠。
+
+   2) 逐日表按月聚合
+      兼职记录是一天一行、一个月 20+ 行，而 01 模块的月度明细是
+      一个月一行。导入时按「日期所在年月」求和，天数、行数都不进模型。
+
+   3) 金额列可缺失，反推补齐
+      只有「总收益」一列 → 整列记作基本工资；
+      有「总收益 + 加班」→ 基本 = 总额 − 加班；
+      有「基本 + 加班」→ 直接相加。
+   ========================================================= */
+/* 列名词典。数组顺序 = 同一角色内的匹配优先级（越靠前越具体），
+   例如同时存在「单日总时长」和「工作时长」时，hours 选前者。 */
+const INC_ROLE_ALIAS = {
+  date:  ['日期','记账日','交易日期','发生日期','date','day'],
+  month: ['月份','年月','所属月份','所属期','期间','month'],
+  total: ['单日总收益','实发工资','实发合计','实发','应发','总收益','到手','合计','总额'],
+  base:  ['工作日收益','基本工资','底薪','固定工资','基本收入','固定收入','日薪','base'],
+  ot:    ['加班收益','加班费','加班收入','其他收入','奖金','绩效','额外收入','ot'],
+  hours: ['单日总时长','总时长','本月工时','工时','小时数','工作时长','hours'],
+};
+/* 角色顺序即判定顺序：先认时间列，再认金额列，最后认工时列。
+   实测「工作日每天加班时长」「其他加班时长」这类列名不该被任何角色认领，
+   靠 alias 用整词（"加班收益"而非"加班"）就能天然排除。 */
+const INC_ROLE_ORDER = ['date','month','total','base','ot','hours'];
+
+function incRoleOf(name){
+  const s = String(name == null ? '' : name).replace(/[\s　]/g, '');
+  if(!s) return null;
+  for(const role of INC_ROLE_ORDER){
+    const arr = INC_ROLE_ALIAS[role];
+    for(let k=0;k<arr.length;k++) if(s.includes(arr[k])) return {role, w:k};
+  }
+  return null;
+}
+/* 表头行数组 → {role: 列下标}。同一角色被多列命中时取 alias 更靠前的那个。 */
+function incColMap(header){
+  const best = {};
+  (header || []).forEach((h, col)=>{
+    const r = incRoleOf(h);
+    if(!r) return;
+    const cur = best[r.role];
+    if(!cur || r.w < cur.w) best[r.role] = {col, w:r.w};
+  });
+  const out = {};
+  Object.keys(best).forEach(k=> out[k] = best[k].col);
+  return out;
+}
+/* 在前 12 行里找表头：必须能定位「时间」和「至少一个金额列」才算数，
+   否则把数据行当表头用会得到一堆空结果 */
+function findIncHeader(rows){
+  const lim = Math.min(rows.length, 12);
+  let best = null, bestScore = -1;
+  for(let i=0;i<lim;i++){
+    const map = incColMap(rows[i]);
+    const hasTime  = map.date !== undefined || map.month !== undefined;
+    const hasMoney = map.total !== undefined || map.base !== undefined || map.ot !== undefined;
+    if(!hasTime || !hasMoney) continue;
+    const score = Object.keys(map).length + (map.date !== undefined ? 2 : 0) + (map.total !== undefined ? 1 : 0);
+    if(score > bestScore){ bestScore = score; best = {row:i, map}; }
+  }
+  return best;
+}
+/* 单元格 → 'YYYY-MM'。覆盖：Excel 序列号、2026/11/22、2026-11、2026年11月、
+   202611、20261122、纯年份。识别不了返回 ''，由调用方记为跳过行。 */
+function ymOfCell(v){
+  if(v === null || v === undefined) return '';
+  const s = String(v).trim();
+  if(!s) return '';
+  if(/^\d+(\.\d+)?$/.test(s)){
+    const n = +s;
+    /* Excel 序列号：20000 ≈ 1954 年、80000 ≈ 2119 年。落在这个区间才当日期，
+       否则 2026 这种纯年份、202611 这种 YYYYMM 会被误判成 1955 年 */
+    if(n >= 20000 && n <= 80000){
+      const d = excelSerialToStr(n);          // 'YYYY-MM-DD HH:MM:SS'
+      return d ? d.slice(0, 7) : '';
+    }
+    if(/^\d{8}$/.test(s)) return s.slice(0,4) + '-' + s.slice(4,6);
+    if(/^\d{6}$/.test(s)) return s.slice(0,4) + '-' + s.slice(4,6);
+    if(/^\d{4}$/.test(s)) return s + '-01';
+    return '';
+  }
+  const m = /(\d{4})\s*[-\/年.]\s*(\d{1,2})/.exec(s);
+  if(m){
+    const mo = +m[2];
+    if(mo >= 1 && mo <= 12) return m[1] + '-' + String(mo).padStart(2,'0');
+  }
+  const y = /^(\d{4})/.exec(s);
+  return y ? y[1] + '-01' : '';
+}
+/* 单元格 → 数字。兼容 ¥ / 全角空格 / 千分位 / 全角减号 */
+function numOfCell(v){
+  if(typeof v === 'number') return isFinite(v) ? v : 0;
+  if(v === null || v === undefined) return 0;
+  const s = String(v)
+    .replace(/[¥￥,\s　元]/g, '')
+    .replace(/[−–—]/g, '-')
+    .trim();
+  if(!s) return 0;
+  const n = parseFloat(s);
+  return isFinite(n) ? n : 0;
+}
+/* 主解析：二维数组 → {months: Map('YYYY-MM' → {base,ot,hours,days}), used, skipped} */
+function parseIncomeTable(rows){
+  const head = findIncHeader(rows);
+  if(!head)
+    throw new Error('没找到表头：需要至少一列「日期」或「月份」，以及一列金额（总收益 / 基本工资 / 加班收益）');
+  const {row: hRow, map} = head;
+  const months = new Map();
+  let used = 0, skipped = 0;
+  for(let i = hRow + 1; i < rows.length; i++){
+    const r = rows[i] || [];
+    const rawTime = map.date !== undefined ? r[map.date] : r[map.month];
+    const ym = ymOfCell(rawTime);
+    const nonEmpty = r.some(c=> String(c == null ? '' : c).trim() !== '');
+    if(!ym){
+      if(nonEmpty) skipped++;              // 有内容但认不出年月 → 计入跳过（如"合计"行）
+      continue;
+    }
+    const total = map.total !== undefined ? numOfCell(r[map.total]) : null;
+    const otRaw = map.ot    !== undefined ? numOfCell(r[map.ot])    : null;
+    const baseRaw = map.base !== undefined ? numOfCell(r[map.base]) : null;
+    const hours = map.hours !== undefined ? numOfCell(r[map.hours]) : 0;
+
+    let base = 0, ot = 0;
+    if(baseRaw !== null){
+      base = baseRaw;
+      ot = otRaw !== null ? otRaw : (total !== null ? Math.max(0, total - base) : 0);
+    }else if(otRaw !== null){
+      ot = otRaw;
+      base = total !== null ? Math.max(0, total - ot) : 0;
+    }else if(total !== null){
+      base = total;                        // 只有一列金额 → 全部记作基本工资，合计才对得上
+    }else{
+      skipped++;
+      continue;
+    }
+    const rec = months.get(ym) || {base:0, ot:0, hours:0, days:0};
+    rec.base += base; rec.ot += ot; rec.hours += hours; rec.days++;
+    months.set(ym, rec);
+    used++;
+  }
+  if(!months.size) throw new Error('表头认出来了，但下面没有一行能解析出日期和金额');
+  return {months, used, skipped, headerRow: hRow + 1, colMap: map};
+}
+/* 任意表格文件 → 二维字符串数组（XLSX / CSV 共用） */
+async function tableFromFile(file){
+  const name = file.name || '';
+  const buf = await file.arrayBuffer();
+  const u8 = new Uint8Array(buf);
+  if(u8.length > 4 && u8[0] === 0xD0 && u8[1] === 0xCF && u8[2] === 0x11 && u8[3] === 0xE0)
+    throw new Error('这是旧版 .xls 格式，请用 Excel / WPS 打开后「另存为」.xlsx 或 .csv 再导入');
+  const isZip = (u8.length > 3 && u8[0] === 0x50 && u8[1] === 0x4B) || /\.xlsx?$|\.et$/i.test(name);
+  if(isZip) return (await xlsxToRows(buf)).rows;
+  return splitCSV(decodeText(buf));
+}
+/* 列角色 → 中文名，用于导入结果里告诉用户"认了哪几列" */
+const INC_ROLE_CN = {date:'日期', month:'月份', total:'总收益', base:'基本工资', ot:'加班/其他', hours:'工时'};
+
+/* 导入收入表。整体流程：解析 → 定年份 → 写入 → 报告。
+   不做「先弹确认框」：月度明细最多 12 条，覆盖可撤销，
+   用 toastAction 给撤销按钮比中途打断更顺手。 */
+let HIST_IMPORTING = false;
+async function importHistFile(input){
+  if(HIST_IMPORTING){ if(input) input.value = ''; toast('正在解析表格，请稍候…'); return; }
+  const f = input && input.files && input.files[0];
+  if(!f) return;
+  HIST_IMPORTING = true;
+  const box = $('histStatus');
+  const say = html=>{ if(box){ box.innerHTML = html; box.classList.add('on'); } };
+  const pick = $('histPick');
+  if(pick){ pick.style.pointerEvents = 'none'; pick.style.opacity = '.55'; }
+  say(`<div><span class="b-warn">正在解析 ${esc(f.name)} …</span></div>`);
+  await new Promise(r=> setTimeout(r, 30));     // 先让「解析中」渲染出来再干重活
+
+  const prevYear = YEAR;
+  try{
+    const rows = await tableFromFile(f);
+    const res = parseIncomeTable(rows);
+    const ys = [...new Set([...res.months.keys()].map(k=> +k.slice(0,4)))].sort();
+    /* 年份对不上：只有一年就自动切过去（比让用户先猜着切年更省事）；
+       多年混杂则明确拒绝，避免"导了一半"的困惑 */
+    let targetYear = YEAR, autoSwitched = false;
+    if(!ys.includes(YEAR)){
+      if(ys.length === 1){ targetYear = ys[0]; autoSwitched = true; YEAR = targetYear; renderYearBar(); }
+      else throw new Error(`表里有 ${ys.length} 个年份（${ys.join('、')}），请先切到要导入的年份再导，或把表拆成单年后分别导入`);
+    }
+    const keys = [...res.months.keys()].filter(k=> +k.slice(0,4) === targetYear).sort();
+    const snapshot = JSON.parse(JSON.stringify(HIST));   // 撤销基线
+    let added = 0, replaced = 0;
+    const lines = [];
+    keys.forEach(ym=>{
+      const v = res.months.get(ym);
+      const rec = {m: ym, base: Math.round(v.base), ot: Math.round(v.ot), hours: Math.round(v.hours*10)/10};
+      const i = HIST.findIndex(d=> d.m === ym);
+      if(i >= 0){ HIST[i] = rec; replaced++; } else { HIST.push(rec); added++; }
+      lines.push(`<div>· <b>${ym}</b> ${fmt(rec.base)} + ${fmt(rec.ot)} = <b>${fmt(rec.base + rec.ot)} 元</b>`
+        + `，${rec.hours} 小时${v.days > 1 ? `（${v.days} 天合计）` : ''}</div>`);
+    });
+    sortHist();
+    renderHistTable();
+    refreshHist();
+
+    const colTxt = INC_ROLE_ORDER.filter(k=> res.colMap[k] !== undefined)
+      .map(k=> `${INC_ROLE_CN[k]}←第 ${res.colMap[k]+1} 列`).join('、');
+    say(`<div><span class="b-ok">✓ ${esc(f.name)}</span> → 表头在第 <b>${res.headerRow}</b> 行，认出：${colTxt}</div>`
+      + `<div>解析 <b>${res.used}</b> 行明细 → 聚合为 <b>${keys.length}</b> 个月；`
+      + `新增 <b>${added}</b> 个月${replaced ? `，覆盖 <b>${replaced}</b> 个月` : ''}`
+      + `${res.skipped ? `，跳过 ${res.skipped} 行（无日期/合计行）` : ''}</div>`
+      + lines.join('')
+      + (autoSwitched ? `<div><span class="b-warn">数据属于 ${targetYear} 年，已自动切换年份</span></div>` : ''));
+
+    toastAction(`已导入 ${keys.length} 个月收入`, '撤销', ()=>{
+      HIST = snapshot;
+      if(autoSwitched){ YEAR = prevYear; renderYearBar(); }
+      sortHist(); renderHistTable(); refreshHist();
+      say('<div><span class="b-warn">已撤销本次导入，数据恢复为导入前的状态</span></div>');
+    });
+  }catch(err){
+    if(YEAR !== prevYear){ YEAR = prevYear; renderYearBar(); }
+    say(`<div><span class="b-err">✗ ${esc(f.name)}</span> → ${esc((err && err.message) || '解析失败')}</div>`
+      + `<div style="margin-top:5px;color:var(--faint);line-height:1.6">支持 .xlsx / .csv。识别规则：表头里要有「日期」或「月份」列，`
+      + `外加金额列（总收益 / 基本工资 / 加班收益）。逐日记录（一天一行）会按月自动汇总成一条。</div>`);
+    toast('导入失败，请查看上方原因');
+  }finally{
+    HIST_IMPORTING = false;
+    if(pick){ pick.style.pointerEvents = ''; pick.style.opacity = ''; }
+    if(input) input.value = '';        // 允许再次选同一个文件
+  }
 }
 
 /* =========================================================
